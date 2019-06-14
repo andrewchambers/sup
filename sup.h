@@ -20,7 +20,10 @@ WaitResult wait_for_event(int32_t msecs, pid_t *pid, int *exit);
 */
 pid_t spawn(char *prog);
 
-
+/*@
+  assigns \nothing;
+*/
+void init_signal_handlers(void);
 
 /*@
   assigns \nothing;

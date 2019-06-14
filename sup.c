@@ -52,7 +52,7 @@ static void sig_handler(int signum) {
     errno = orig_errno;
 }
 
-void make_fd_non_blocking(int fd) {
+static void make_fd_non_blocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
   if (flags == -1) {
     perror("fnctl failed");
@@ -92,7 +92,7 @@ void init_signal_handlers(void)
   make_fd_non_blocking(signal_pipes[1]);
 }
 
-void reset_signal_handlers(void) {
+static void reset_signal_handlers(void) {
   struct sigaction act;
   sigset_t block_mask;
   memset(&act, 0, sizeof(act));
@@ -186,6 +186,7 @@ WaitResult wait_for_event(int32_t timeout_msecs, pid_t *pid, int *exit)
     if (wpid == -1) { \
       if (errno == EINTR) \
         goto again; \
+      perror("waitpid failed"); \
       abort(); \
     } else if (wpid > 0) { \
       *pid = wpid; \
@@ -206,7 +207,7 @@ WaitResult wait_for_event(int32_t timeout_msecs, pid_t *pid, int *exit)
 
   // Check once for dead children before blocking.
   // This means if we ever drop a SIGCHLD it will be
-  // immediately collected on the next blocking wait call.
+  // immediately collected on the next wait_for_event.
   WAIT_CHILD();
 
   fds[0].fd = signal_pipes[0];
@@ -217,6 +218,7 @@ WaitResult wait_for_event(int32_t timeout_msecs, pid_t *pid, int *exit)
     if (errno == EINTR) {
       goto again;
     }
+    perror("poll failed");
     abort();
   }
 
@@ -232,6 +234,7 @@ WaitResult wait_for_event(int32_t timeout_msecs, pid_t *pid, int *exit)
   if (nread == -1) {
     if (errno == EINTR)
       goto again;
+    perror("read failed");
     abort();
   }
 
@@ -245,7 +248,7 @@ WaitResult wait_for_event(int32_t timeout_msecs, pid_t *pid, int *exit)
   return WAIT_SHUTDOWN_SIGNAL;
 }
 
-int unreachable(void)
+void unreachable(void)
 {
   exit(0);
 }

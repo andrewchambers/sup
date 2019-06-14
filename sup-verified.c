@@ -10,11 +10,10 @@
 #include <signal.h>
 
 /*
- Define some external functions we use specification.
+ Define somespecifications for external functions we use.
  We must be very careful with our definitions, they
- are close enough for our spec, but not totally accurate.
-
- For example, should we include 'assigns' errno?
+ are close enough for our spec and the properties
+ we care about.
 */
 
 /*@
