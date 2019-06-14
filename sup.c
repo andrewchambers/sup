@@ -92,7 +92,7 @@ void init_signal_handlers(void)
   make_fd_non_blocking(signal_pipes[1]);
 }
 
-static void reset_signal_handlers(void) {
+void reset_signal_handlers(void) {
   struct sigaction act;
   sigset_t block_mask;
   memset(&act, 0, sizeof(act));
@@ -109,7 +109,8 @@ static void reset_signal_handlers(void) {
   }
 }
 
-static void mask_signals(int how) {
+static void mask_signals(int how)
+{
   sigset_t block_mask;
   sigemptyset(&block_mask);
   sigaddset(&block_mask, SIGINT);
@@ -123,45 +124,14 @@ static void mask_signals(int how) {
   }
 }
 
-
-pid_t spawn(char *prog)
+void block_signal_handlers(void)
 {
-
-  /*
-    Mask signals, fork, do some child/parent specific
-    setup, and then renable signals.
-
-    We set a new process group in
-    the parent and the child, one
-    of these should always succeed
-    and we guarantee both ends agree
-    on the process group without a race.
-    I am not sure there is anything
-    useful we can do if both ends error, and it 
-    cannot be detected.
-  */
-
-
   mask_signals(SIG_BLOCK);
+}
 
-	pid_t pid = fork();
-
-	if (pid > 0) {
-    mask_signals(SIG_UNBLOCK);
-    setpgid(pid, pid);
-		return pid;
-	} else if (pid == 0) {
-    reset_signal_handlers();
-    mask_signals(SIG_UNBLOCK);
-    setpgid(pid, pid);
-		char *const args[2] = {prog, NULL};
-		execvp(prog, args);
-		perror("execvpe failed");
-		abort();
-	} else {
-    mask_signals(SIG_UNBLOCK);
-    return -1;
-  }
+void unblock_signal_handlers(void)
+{
+  mask_signals(SIG_UNBLOCK);
 }
 
 
@@ -252,3 +222,5 @@ void unreachable(void)
 {
   exit(0);
 }
+
+

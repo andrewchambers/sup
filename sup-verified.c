@@ -9,8 +9,10 @@
 #include <unistd.h>
 #include <signal.h>
 
+#include "sup.h"
+
 /*
- Define somespecifications for external functions we use.
+ Define some specifications for external functions we use.
  We must be very careful with our definitions, they
  are close enough for our spec and the properties
  we care about.
@@ -24,9 +26,30 @@ pid_t waitpid(pid_t pid, int *status, int options);
 /*@
   assigns \nothing;
  */
-int kill(pid_t pid, int sig); 
+int kill(pid_t pid, int sig);
 
-#include "sup.h"
+/*@
+  assigns \nothing;
+*/
+int execvp(const char *file, char *const argv[]);
+
+/*@
+  requires signal_handlers_blocked == 1;
+  assigns \nothing;
+  ensures \result >= -1;
+*/
+pid_t fork(void);
+
+/*@
+  assigns \nothing;
+*/
+int setpgid(pid_t pid, pid_t gpid);
+
+
+/*@
+  assigns \nothing;
+*/
+void perror(const char *s);
 
 #define MAX_PROCS 128
 
@@ -65,6 +88,59 @@ double token_bucket_capacity;
 
 int32_t check_interval_secs = 10;
 
+/*@ 
+  requires signal_handlers_installed == 1;
+  requires signal_handlers_blocked == 0;
+  ensures \result >= -1;
+  ensures signal_handlers_installed == 1;
+  ensures signal_handlers_blocked == 0;
+*/
+pid_t spawn_child(char *prog)
+{
+
+  /*
+    Mask signals, fork, do some child/parent specific
+    setup, and then renable signals.
+
+    We set a new process group in
+    the parent and the child, one
+    of these should always succeed
+    and we guarantee both ends agree
+    on the process group without a race.
+    I am not sure there is anything
+    useful we can do if both ends error, and it 
+    cannot be detected.
+  */
+
+
+  block_signal_handlers();
+
+  pid_t pid = fork();
+
+  if (pid > 0) {
+    unblock_signal_handlers();
+    setpgid(pid, pid);
+  } else if (pid == 0) {
+    reset_signal_handlers();
+    unblock_signal_handlers();
+    // setpgid(pid, pid);
+    char *const args[2] = {prog, NULL};
+    // execvp(prog, args);
+    // perror("execvpe failed");
+    unreachable();
+    /*
+      This code is unreachable due to exec, but to make
+      the post conditions easier we can pretend it keeps running.
+    */
+    /*@ ghost signal_handlers_installed = 1; */
+    pid = -1;
+  } else {
+    unblock_signal_handlers();
+    pid = -1;
+  }
+
+  return pid;
+}
 
 /*@
   requires 0 <= nprocs <= MAX_PROCS;
@@ -86,21 +162,20 @@ void handle_death(pid_t pid, int exitcode)
 }
 
 /*@
+  requires signal_handlers_installed == 1;
+  requires signal_handlers_blocked == 0;
   requires 0 <= nprocs <= MAX_PROCS;
+  requires child > 0;
   requires \valid(supervised + (0 .. nprocs-1));
   assigns supervised[0 .. nprocs-1];
 */
-OperationResult run_sync(char *prog, int32_t timeout_msecs)
+OperationResult wait_for_child(pid_t child, int32_t timeout_msecs)
 {
   int termsent = 0;
   int done = 0;
   pid_t dead = 0;
   int exitcode = 0;
   int sigterm = 0;
-  pid_t pid = spawn(prog);
-
-  if (pid == -1)
-    return OP_FAILED;
 
  /*@ 
     loop assigns done, timeout_msecs, dead, sigterm, termsent;
@@ -113,20 +188,20 @@ OperationResult run_sync(char *prog, int32_t timeout_msecs)
     
     if (wr == WAIT_SHUTDOWN_SIGNAL || wr == WAIT_TIMEOUT) {
       /* 
-        Here we send a kill
-        What can we do here if kill failes?
+        Here we send a kill to the pgid.
+        What can we do here if kill fails?
         not much, we can progress
         to SIGKILL anyway and try forever
         on 'unkillable' processes.
       */
-      kill(-pid, termsent == 0 ? SIGTERM : SIGKILL);
+      kill(-child, termsent == 0 ? SIGTERM : SIGKILL);
       termsent = 1;
       timeout_msecs = 7000;
     }
     
     if (wr == WAIT_PROC_DIED) {
       handle_death(dead, exitcode);
-      done = (pid == dead);
+      done = (child == dead);
     }
   }
 
@@ -292,6 +367,8 @@ OperationResult check(void)
 }
 
 /*@
+  requires signal_handlers_installed == 1;
+  requires signal_handlers_blocked == 0;
   requires 0 <= nprocs <= MAX_PROCS;
   requires \valid(supervised + (0 .. nprocs-1));
   assigns supervised[0 .. nprocs-1];
@@ -321,6 +398,8 @@ OperationResult wait_and_check(void)
 
 
 /*@
+  requires signal_handlers_installed == 1;
+  requires signal_handlers_blocked == 0;
   requires 0 <= nprocs <= MAX_PROCS;
   requires \valid(supervised + (0 .. nprocs-1));
   assigns supervised[0 .. nprocs-1];
@@ -355,6 +434,8 @@ OperationResult supervise_once()
 
 
 /*@
+  requires signal_handlers_installed == 1;
+  requires signal_handlers_blocked == 0;
   requires 0 <= nprocs <= MAX_PROCS;
   requires \valid(supervised + (0 .. nprocs-1));
   assigns supervised[0 .. nprocs-1];
@@ -387,3 +468,8 @@ int supervise_loop(void)
   return ok;
 }
 
+
+
+int main (int argc, char **argv)
+{
+}
