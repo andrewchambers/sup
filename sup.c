@@ -5,10 +5,10 @@
 #include <stdlib.h>
 #include "sup.h"
 
-int32_t spawn(char *prog)
+pid_t spawn(char *prog)
 {
 	pid_t pid = fork();
-	if (pid == -1) {
+	if (pid < 0) {
 		return -1;
 	}
 

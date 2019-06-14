@@ -6,29 +6,50 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <signal.h>
+
+/*
+ Define some external functions we use specification.
+ We must be very careful with our definitions, they
+ are close enough for our spec, but not totally accurate.
+
+ For example, should we include 'assigns' errno?
+*/
+
+/*@
+  assigns *status;
+ */
+pid_t waitpid(pid_t pid, int *status, int options); 
+
+/*@
+  assigns \nothing;
+ */
+int kill(pid_t pid, int sig); 
+
 #include "sup.h"
 
 #define MAX_PROCS 128
 
 typedef enum {
-  	SUPERVISEE_STOPPED,
-    SUPERVISEE_CLEANED,
-  	SUPERVISEE_STARTING,
-  	SUPERVISEE_RUNNING,
-  	SUPERVISEE_STOPPING,
+  SUPERVISEE_STOPPED,
+  SUPERVISEE_CLEANED,
+  SUPERVISEE_STARTING,
+  SUPERVISEE_RUNNING,
 } SuperiseeState;
 
 
 typedef enum {
-    OP_OK,
-    OP_FAILED,
-    OP_CANCELLED,
-    OP_LOGIC_BUG,
+  OP_OK,
+  OP_FAILED,
+  OP_CANCELLED,
+  OP_LOGIC_BUG,
 } OperationResult;
 
 typedef struct {
   SuperiseeState state;
-  int64_t pgid;
+  pid_t pid;
+  int exitcode;
 
   const char *clean;
   const char *run;
@@ -46,28 +67,74 @@ double token_bucket_capacity;
 int32_t check_interval_secs = 10;
 
 
+/*@
+  requires 0 <= nprocs <= MAX_PROCS;
+  requires \valid(supervised + (0 .. nprocs-1));
+  assigns supervised[0 .. nprocs-1];
+*/
+void handle_death(pid_t pid, int exitcode)
+{
+  /*@ 
+    loop assigns i, supervised[0 .. nprocs-1];
+    loop invariant 0 <= i <= nprocs;
+  */
+  for (int i = 0; i < nprocs; i++) {
+    if (supervised[i].state == SUPERVISEE_RUNNING && supervised[i].pid == pid) {
+      supervised[i].state = SUPERVISEE_STOPPED;
+      supervised[i].exitcode = exitcode;
+    }
+  }
+}
 
 /*@
-  assigns \nothing;
+  requires 0 <= nprocs <= MAX_PROCS;
+  requires \valid(supervised + (0 .. nprocs-1));
+  assigns supervised[0 .. nprocs-1];
 */
-OperationResult run_sync(char *prog, int32_t timeout_secs)
+OperationResult run_sync(char *prog, int64_t timeout_usecs)
 {
-  int32_t pid = spawn(prog);
+  int termsent = 0;
+  int done = 0;
+  pid_t dead = 0;
+  int exitcode = 0;
+  int sigterm = 0;
+  pid_t pid = spawn(prog);
+
   if (pid == -1)
     return OP_FAILED;
 
-  WaitResult wr = wait(timeout_secs);
-
-  // REAP pid...
-
-  switch (wr) {
-  case WAIT_TIMER_TRIPPED:
-    return OP_FAILED;
-  case WAIT_PROC_DIED:
-    return OP_FAILED;
-  case WAIT_TERMINATED:
-    return OP_CANCELLED;
+ /*@ 
+    loop assigns done, timeout_usecs, dead, sigterm, termsent;
+    loop assigns exitcode, supervised[0 .. nprocs-1];
+  */
+  while (!done) {
+    WaitResult wr = wait(&timeout_usecs, &dead, &exitcode);
+    if (wr == WAIT_SIGTERM)
+      sigterm = 1;
+    
+    if (wr == WAIT_SIGTERM || wr == WAIT_TIMEOUT) {
+      /* 
+        Here we send a kill
+        What can we do here if kill failes?
+        not much, we can progress
+        to SIGKILL anyway and try forever
+        on 'unkillable' processes.
+      */
+      kill(-pid, termsent == 0 ? SIGTERM : SIGKILL);
+      termsent = 1;
+      timeout_usecs = 7000000;
+    }
+    
+    if (wr == WAIT_PROC_DIED) {
+      handle_death(pid, exitcode);
+      done = (pid == dead);
+    }
   }
+
+  if (sigterm)
+    return OP_CANCELLED;
+
+  return exitcode ? OP_FAILED : OP_OK;
 }
 
 
@@ -77,12 +144,12 @@ OperationResult run_sync(char *prog, int32_t timeout_secs)
 */
 int add_supervisee(Supervisee s)
 {
-	if (nprocs >= MAX_PROCS)
-		return 0;
-	
-	supervised[nprocs] = s;
-	nprocs += 1;
-	return 1;
+  if (nprocs >= MAX_PROCS)
+    return 0;
+  
+  supervised[nprocs] = s;
+  nprocs += 1;
+  return 1;
 }
 
 /*@
@@ -229,9 +296,8 @@ OperationResult check(void)
 */
 OperationResult wait_and_check(void)
 {
-  WaitResult wr = wait(check_interval_secs);
-  if (wr == WAIT_PROC_DIED)
-    return OP_FAILED;
+  
+  /* WaitResult wr = wait(check_interval_secs, ...); */
 
   return check();
 }

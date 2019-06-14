@@ -1,21 +1,23 @@
 
 typedef enum {
-    WAIT_TIMER_TRIPPED,
+    WAIT_TIMEOUT,
     WAIT_PROC_DIED,
-    WAIT_TERMINATED,
+    WAIT_SIGTERM,
 } WaitResult;
 
 /*@
-  assigns \nothing;
-  ensures \result == WAIT_TIMER_TRIPPED 
-    || \result == WAIT_PROC_DIED;
+  assigns *usecs, *pid, *exit;
+  ensures \result == WAIT_TIMEOUT 
+    || \result == WAIT_PROC_DIED
+    || \result == WAIT_SIGTERM;
 */
-WaitResult wait(int32_t seconds);
+WaitResult wait(int64_t *usecs, pid_t *pid, int *exit);
 
 
 /*@
   assigns \nothing;
+  ensures \result >= -1;
 */
-int32_t spawn(char *prog);
+pid_t spawn(char *prog);
 
 
