@@ -86,7 +86,7 @@ Supervisee supervised[MAX_PROCS];
 double restart_token_bucket_level;
 double token_bucket_capacity;
 
-int32_t check_interval_secs = 10;
+int32_t check_interval_msecs = 10000;
 
 /*@ 
   requires signal_handlers_installed == 1;
@@ -213,17 +213,14 @@ OperationResult wait_for_child(pid_t child, int32_t timeout_msecs)
 
 
 /*@
-  assigns supervised[\old(nprocs)];
-  assigns nprocs;
+  requires 0 <= nprocs < MAX_PROCS;
+  assigns nprocs, supervised[\old(nprocs)];
+  ensures nprocs == \old(nprocs) + 1;
 */
-int add_supervisee(Supervisee s)
+void add_supervisee(Supervisee s)
 {
-  if (nprocs >= MAX_PROCS)
-    return 0;
-  
   supervised[nprocs] = s;
-  nprocs += 1;
-  return 1;
+  nprocs = nprocs + 1;
 }
 
 /*@
@@ -254,16 +251,23 @@ OperationResult clean_supervisee(Supervisee *s)
 }
 
 /*@
-  requires \valid(s);
-  assigns \nothing;
+  requires signal_handlers_installed == 1;
+  requires signal_handlers_blocked == 0;
+  requires 0 <= nprocs <= MAX_PROCS;
+  requires 0 <= i <= nprocs-1;
+  assigns supervised[i];
+  assigns signal_handlers_installed;
+  assigns signal_handlers_blocked;
 */
-OperationResult start_supervisee(Supervisee *s)
+OperationResult start_supervisee(int i)
 {
-  if (s->state != SUPERVISEE_CLEANED) {
-    unreachable();
-    return OP_UNREACHABLE;
-  }
+  pid_t pid = -1;
+  pid = spawn_child(supervised[i].run);
+  //if (pid == -1)
+  //  return OP_FAILED;
 
+  supervised[i].state = SUPERVISEE_RUNNING;
+  supervised[i].pid = pid;
   return OP_OK;
 }
 
@@ -282,16 +286,56 @@ OperationResult check_supervisee(Supervisee *s)
 }
 
 /*@
-  requires \valid(s);
-  assigns *s;
+  requires signal_handlers_installed == 1;
+  requires signal_handlers_blocked == 0;
+  requires 0 <= nprocs <= MAX_PROCS;
+  requires 0 <= i <= nprocs-1;
+  requires \valid(supervised + (0 .. nprocs-1));
+  assigns supervised[0 .. nprocs-1];
+  ensures supervised[i].state == SUPERVISEE_STOPPED;
 */
-OperationResult stop_supervisee(Supervisee *s)
+OperationResult stop_supervisee(int i)
 {
-  s->state = SUPERVISEE_STOPPED;
-  return OP_OK;
+  int gotshutdown = 0;
+
+  if (supervised[i].state == SUPERVISEE_RUNNING) {
+    int timeout_msecs = 5000;
+    pid_t pid = supervised[i].pid;
+
+    kill(-pid, SIGTERM);
+    kill(-pid, SIGCONT);
+
+    /*@ 
+      loop assigns gotshutdown, timeout_msecs;
+      loop assigns supervised[0 .. nprocs-1];
+    */
+    while (supervised[i].state == SUPERVISEE_RUNNING) {
+      pid_t dead = 0;
+      int exitcode = 0;
+      
+      WaitResult wr = wait_for_event(timeout_msecs, &dead, &exitcode);
+
+      if (wr == WAIT_SHUTDOWN_SIGNAL)
+        gotshutdown = 1;
+      
+      if (wr == WAIT_TIMEOUT) {
+        kill(-pid, SIGKILL);
+        timeout_msecs = 7000;
+      }
+      
+      if (wr == WAIT_PROC_DIED) {
+        handle_death(dead, exitcode);
+      }
+    }
+  }
+
+  supervised[i].state = SUPERVISEE_STOPPED;
+  return gotshutdown ? OP_SHUTDOWN_REQUESTED : OP_OK;
 }
 
 /*@
+  requires signal_handlers_installed == 1;
+  requires signal_handlers_blocked == 0;
   requires 0 <= nprocs <= MAX_PROCS;
   requires \valid(supervised + (0 .. nprocs-1));
   assigns supervised[0 .. nprocs-1];
@@ -305,7 +349,7 @@ OperationResult stop(void)
     loop invariant 0 <= i <= nprocs;
   */
   for (int i = 0; i < nprocs && result == OP_OK; i++) {
-    result = stop_supervisee(&supervised[nprocs-i-1]);
+    result = stop_supervisee(nprocs-i-1);
   }
 
   return result;
@@ -332,20 +376,26 @@ OperationResult clean(void)
 }
 
 /*@
+  requires signal_handlers_installed == 1;
+  requires signal_handlers_blocked == 0;
   requires 0 <= nprocs <= MAX_PROCS;
+  requires \valid(supervised + (0 .. nprocs-1));
   assigns supervised[0 .. nprocs-1];
 */
 OperationResult start(void)
 {
+  OperationResult result = OP_OK;
+
   /*@
-    loop assigns i;
+    loop assigns i, result;
+    loop assigns supervised[0 .. nprocs-1];
     loop invariant 0 <= i <= nprocs;
   */
-  for (int i = 0; i < nprocs; i++) {
-    start_supervisee(&supervised[i]);
+  for (int i = 0; i < nprocs && result == OP_OK; i++) {
+    result = start_supervisee(i);
   }
 
-  return OP_OK;
+  return result;
 }
 
 /*@
@@ -380,9 +430,8 @@ OperationResult wait_and_check(void)
   pid_t dead = 0;
   int exitcode = 0;
   int sigterm = 0;
-  int32_t timeout_msecs = 5000; // check_interval_secs * 1000;
 
-  WaitResult wr = wait_for_event(timeout_msecs, &dead, &exitcode);
+  WaitResult wr = wait_for_event(check_interval_msecs, &dead, &exitcode);
   if (wr == WAIT_SHUTDOWN_SIGNAL) {
     return OP_SHUTDOWN_REQUESTED;
   } else if (wr == WAIT_PROC_DIED) {
@@ -469,7 +518,26 @@ int supervise_loop(void)
 }
 
 
-
+/*@
+  requires signal_handlers_installed == 0;
+  requires signal_handlers_blocked == 0;
+  requires nprocs == 0;
+*/
 int main (int argc, char **argv)
 {
+  install_signal_handlers();
+  
+  Supervisee s = (Supervisee) {
+    .state = SUPERVISEE_STOPPED,
+    .pid = -1,
+    .exitcode = 0,
+    .clean = NULL,
+    .run = "./foo",
+    .wait = NULL,
+    .check = NULL,
+    .stop = NULL,
+  };
+
+  add_supervisee(s);
+  supervise_loop();
 }
