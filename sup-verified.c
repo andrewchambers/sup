@@ -42,8 +42,8 @@ typedef enum {
 typedef enum {
   OP_OK,
   OP_FAILED,
-  OP_CANCELLED,
-  OP_LOGIC_BUG,
+  OP_SHUTDOWN_REQUESTED,
+  OP_UNREACHABLE,
 } OperationResult;
 
 typedef struct {
@@ -91,7 +91,7 @@ void handle_death(pid_t pid, int exitcode)
   requires \valid(supervised + (0 .. nprocs-1));
   assigns supervised[0 .. nprocs-1];
 */
-OperationResult run_sync(char *prog, int64_t timeout_usecs)
+OperationResult run_sync(char *prog, int32_t timeout_msecs)
 {
   int termsent = 0;
   int done = 0;
@@ -104,15 +104,15 @@ OperationResult run_sync(char *prog, int64_t timeout_usecs)
     return OP_FAILED;
 
  /*@ 
-    loop assigns done, timeout_usecs, dead, sigterm, termsent;
+    loop assigns done, timeout_msecs, dead, sigterm, termsent;
     loop assigns exitcode, supervised[0 .. nprocs-1];
   */
   while (!done) {
-    WaitResult wr = wait(&timeout_usecs, &dead, &exitcode);
-    if (wr == WAIT_SIGTERM)
+    WaitResult wr = wait_for_event(timeout_msecs, &dead, &exitcode);
+    if (wr == WAIT_SHUTDOWN_SIGNAL)
       sigterm = 1;
     
-    if (wr == WAIT_SIGTERM || wr == WAIT_TIMEOUT) {
+    if (wr == WAIT_SHUTDOWN_SIGNAL || wr == WAIT_TIMEOUT) {
       /* 
         Here we send a kill
         What can we do here if kill failes?
@@ -122,17 +122,17 @@ OperationResult run_sync(char *prog, int64_t timeout_usecs)
       */
       kill(-pid, termsent == 0 ? SIGTERM : SIGKILL);
       termsent = 1;
-      timeout_usecs = 7000000;
+      timeout_msecs = 7000;
     }
     
     if (wr == WAIT_PROC_DIED) {
-      handle_death(pid, exitcode);
+      handle_death(dead, exitcode);
       done = (pid == dead);
     }
   }
 
   if (sigterm)
-    return OP_CANCELLED;
+    return OP_SHUTDOWN_REQUESTED;
 
   return exitcode ? OP_FAILED : OP_OK;
 }
@@ -166,7 +166,8 @@ int take_restart_token(void) {
 OperationResult clean_supervisee(Supervisee *s)
 {
   if (s->state != SUPERVISEE_STOPPED) {
-    return OP_LOGIC_BUG;
+    unreachable();
+    return OP_UNREACHABLE;
   }
 
   // TODO start clean.
@@ -185,7 +186,8 @@ OperationResult clean_supervisee(Supervisee *s)
 OperationResult start_supervisee(Supervisee *s)
 {
   if (s->state != SUPERVISEE_CLEANED) {
-    return OP_LOGIC_BUG;
+    unreachable();
+    return OP_UNREACHABLE;
   }
 
   return OP_OK;
@@ -198,7 +200,8 @@ OperationResult start_supervisee(Supervisee *s)
 OperationResult check_supervisee(Supervisee *s)
 {
   if (s->state != SUPERVISEE_RUNNING) {
-    return OP_LOGIC_BUG;
+    unreachable();
+    return OP_UNREACHABLE;
   }
 
   return OP_OK;
@@ -296,10 +299,25 @@ OperationResult check(void)
 */
 OperationResult wait_and_check(void)
 {
-  
-  /* WaitResult wr = wait(check_interval_secs, ...); */
 
-  return check();
+  int done = 0;
+  pid_t dead = 0;
+  int exitcode = 0;
+  int sigterm = 0;
+  int32_t timeout_msecs = 5000; // check_interval_secs * 1000;
+
+  WaitResult wr = wait_for_event(timeout_msecs, &dead, &exitcode);
+  if (wr == WAIT_SHUTDOWN_SIGNAL) {
+    return OP_SHUTDOWN_REQUESTED;
+  } else if (wr == WAIT_PROC_DIED) {
+    handle_death(dead, exitcode);
+    return OP_FAILED;
+  } else if (wr == WAIT_TIMEOUT) {
+    return check();
+  } else {
+    unreachable();
+    return OP_UNREACHABLE;
+  }
 }
 
 
@@ -356,6 +374,9 @@ int supervise_loop(void)
     result = supervise_once();
   }
 
+  if (result != OP_SHUTDOWN_REQUESTED)
+    ok = 0;
+
   result = stop();
   if (result != OP_OK)
     ok = 0;
@@ -364,6 +385,6 @@ int supervise_loop(void)
   if (result != OP_OK)
     ok = 0;
 
-  return 1;
+  return ok;
 }
 

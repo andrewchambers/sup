@@ -2,16 +2,16 @@
 typedef enum {
     WAIT_TIMEOUT,
     WAIT_PROC_DIED,
-    WAIT_SIGTERM,
+    WAIT_SHUTDOWN_SIGNAL
 } WaitResult;
 
 /*@
-  assigns *usecs, *pid, *exit;
+  assigns *pid, *exit;
   ensures \result == WAIT_TIMEOUT 
     || \result == WAIT_PROC_DIED
-    || \result == WAIT_SIGTERM;
+    || \result == WAIT_SHUTDOWN_SIGNAL;
 */
-WaitResult wait(int64_t *usecs, pid_t *pid, int *exit);
+WaitResult wait_for_event(int32_t msecs, pid_t *pid, int *exit);
 
 
 /*@
@@ -21,3 +21,8 @@ WaitResult wait(int64_t *usecs, pid_t *pid, int *exit);
 pid_t spawn(char *prog);
 
 
+
+/*@
+  assigns \nothing;
+*/
+void unreachable(void);
