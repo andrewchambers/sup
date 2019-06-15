@@ -65,7 +65,6 @@ typedef enum {
   OP_OK,
   OP_FAILED,
   OP_SHUTDOWN_REQUESTED,
-  OP_UNREACHABLE,
 } OperationResult;
 
 typedef struct {
@@ -250,23 +249,38 @@ void add_supervisee(Supervisee s)
   requires 0 <= i < nprocs;
   assigns signal_handlers_installed;
   assigns signal_handlers_blocked;
-  assigns supervised[i];
+  assigns supervised[0 .. nprocs-1];
   ensures signal_handlers_configured;
   ensures valid_supervised;
   ensures supervised[i].state == SUPERVISEE_CLEANED;
   ensures supervised[i].exitcode == -1;
   ensures supervised[i].pid == -1;
+  ensures \result == OP_OK || \result == OP_FAILED || \result == OP_SHUTDOWN_REQUESTED;
 */
 OperationResult clean_supervisee(int i)
 {
-  // TODO start clean.
+  OperationResult result = OP_OK;
 
-  // TODO wait for clean.
+  if (supervised[i].clean) {
+    log_event("running clean");
+    pid_t pid = spawn_child(supervised[i].clean);
+    if (pid > 0) {
+      result = wait_for_child(pid, WAIT_FOR_CHILD_FLAG_IGNORE_SHUTDOWN_REQUESTS, 5000); /* TODO right timeout */
+    } else {
+      result = OP_FAILED;
+    }
+
+    if (result != OP_OK) {
+      log_event("clean command failed");
+    }
+  }
+
   // or kill clean on other error.
   supervised[i].state = SUPERVISEE_CLEANED;
   supervised[i].exitcode = -1;
   supervised[i].pid = -1;
-  return OP_OK;
+  
+  return result;
 }
 
 /*@
@@ -278,6 +292,7 @@ OperationResult clean_supervisee(int i)
   assigns signal_handlers_installed;
   assigns signal_handlers_blocked;
   assigns supervised[0 .. nprocs-1];
+  ensures \result == OP_OK || \result == OP_FAILED || \result == OP_SHUTDOWN_REQUESTED;
 */
 OperationResult wait_supervisee(int i)
 {
@@ -300,6 +315,7 @@ OperationResult wait_supervisee(int i)
   assigns signal_handlers_installed;
   assigns signal_handlers_blocked;
   assigns supervised[0 .. nprocs-1];
+  ensures \result == OP_OK || \result == OP_FAILED || \result == OP_SHUTDOWN_REQUESTED;
 */
 OperationResult start_supervisee(int i)
 {
@@ -510,6 +526,7 @@ OperationResult clean(void)
   ensures valid_supervised;
   assigns signal_handlers_installed;
   assigns signal_handlers_blocked;
+  ensures \result == OP_OK || \result == OP_SHUTDOWN_REQUESTED || \result == OP_FAILED;
 */
 OperationResult start(void)
 {
@@ -523,6 +540,7 @@ OperationResult start(void)
     loop invariant valid_supervised;
     loop invariant 0 <= i <= nprocs;
     loop invariant signal_handlers_configured;
+    loop invariant result == OP_OK || result == OP_SHUTDOWN_REQUESTED || result == OP_FAILED;
     loop variant nprocs - i;
   */
   for (int i = 0; i < nprocs && result == OP_OK; i++) {
@@ -589,7 +607,7 @@ OperationResult wait_and_check(void)
     return check();
   } else {
     unreachable();
-    return OP_UNREACHABLE;
+    return OP_FAILED;
   }
 }
 
@@ -676,7 +694,7 @@ int supervise_loop(void)
   if (result != OP_SHUTDOWN_REQUESTED)
     ok = 0;
 
-  log_event("performing shutdown, stopping children");
+  log_event("supervisor exiting, stopping children");
   result = stop();
   /*@ assert result == OP_OK || result == OP_SHUTDOWN_REQUESTED; */
 
@@ -695,7 +713,7 @@ int supervise_loop(void)
     }
   }
   
-  log_event("performing shutdown, cleaning up");
+  log_event("supervisor exiting, cleaning up");
   result = clean();
   if (result != OP_OK)
     ok = 0;
@@ -716,7 +734,7 @@ int main (int argc, char **argv)
     .state = SUPERVISEE_STOPPED,
     .pid = -1,
     .exitcode = -1,
-    .clean = NULL,
+    .clean = "./clean",
     .run = "./run",
     .wait = "./wait",
     .check = "./check",
