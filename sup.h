@@ -3,6 +3,9 @@
 /*@ ghost int signal_handlers_installed = 0; */
 /*@ ghost int signal_handlers_blocked = 0; */
 
+/*@ predicate signal_handlers_configured{L} = 
+  signal_handlers_installed == 1 && signal_handlers_blocked == 0; */
+
 /*@
   ensures signal_handlers_installed == 1;
   assigns signal_handlers_installed;
@@ -37,8 +40,7 @@ typedef enum {
 
 
 /*@
-  requires signal_handlers_installed == 1;
-  requires signal_handlers_blocked == 0;
+  requires signal_handlers_configured;
   assigns *pid, *exit;
   ensures \result == WAIT_TIMEOUT 
     || \result == WAIT_PROC_DIED

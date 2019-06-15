@@ -80,8 +80,16 @@ typedef struct {
   const char *stop;
 } Supervisee;
 
+/*@ predicate valid_supervisee{L}(Supervisee s) = s.pid >= -1; */
+
 size_t nprocs = 0;
 Supervisee supervised[MAX_PROCS];
+
+/*@ predicate valid_supervised{L} = 
+  (0 <= nprocs <= MAX_PROCS) 
+   && (\valid(supervised + (0 .. nprocs-1))); */
+
+// TODO && (\forall integer i; 0 <= i < nprocs ==> valid_supervisee(supervised[i]))
 
 double restart_token_bucket_level;
 double token_bucket_capacity;
@@ -89,11 +97,11 @@ double token_bucket_capacity;
 int32_t check_interval_msecs = 10000;
 
 /*@ 
-  requires signal_handlers_installed == 1;
-  requires signal_handlers_blocked == 0;
+  requires signal_handlers_configured;
   ensures \result >= -1;
-  ensures signal_handlers_installed == 1;
-  ensures signal_handlers_blocked == 0;
+  ensures signal_handlers_configured;
+  assigns signal_handlers_installed;
+  assigns signal_handlers_blocked;
 */
 pid_t spawn_child(char *prog)
 {
@@ -143,8 +151,8 @@ pid_t spawn_child(char *prog)
 }
 
 /*@
-  requires 0 <= nprocs <= MAX_PROCS;
-  requires \valid(supervised + (0 .. nprocs-1));
+  requires valid_supervised;
+  ensures valid_supervised;
   assigns supervised[0 .. nprocs-1];
 */
 void handle_death(pid_t pid, int exitcode)
@@ -162,11 +170,10 @@ void handle_death(pid_t pid, int exitcode)
 }
 
 /*@
-  requires signal_handlers_installed == 1;
-  requires signal_handlers_blocked == 0;
-  requires 0 <= nprocs <= MAX_PROCS;
+  requires signal_handlers_configured;
+  requires valid_supervised;
   requires child > 0;
-  requires \valid(supervised + (0 .. nprocs-1));
+  ensures valid_supervised;
   assigns supervised[0 .. nprocs-1];
 */
 OperationResult wait_for_child(pid_t child, int32_t timeout_msecs)
@@ -214,8 +221,10 @@ OperationResult wait_for_child(pid_t child, int32_t timeout_msecs)
 
 /*@
   requires 0 <= nprocs < MAX_PROCS;
+  requires valid_supervised;
   assigns nprocs, supervised[\old(nprocs)];
   ensures nprocs == \old(nprocs) + 1;
+  ensures valid_supervised;
 */
 void add_supervisee(Supervisee s)
 {
@@ -251,20 +260,20 @@ OperationResult clean_supervisee(Supervisee *s)
 }
 
 /*@
-  requires signal_handlers_installed == 1;
-  requires signal_handlers_blocked == 0;
-  requires 0 <= nprocs <= MAX_PROCS;
-  requires 0 <= i <= nprocs-1;
-  assigns supervised[i];
+  requires signal_handlers_configured;
+  requires valid_supervised;
+  ensures signal_handlers_configured;
+  ensures valid_supervised;
   assigns signal_handlers_installed;
   assigns signal_handlers_blocked;
+  assigns supervised[i];
 */
 OperationResult start_supervisee(int i)
 {
   pid_t pid = -1;
   pid = spawn_child(supervised[i].run);
-  //if (pid == -1)
-  //  return OP_FAILED;
+  if (pid == -1)
+    return OP_FAILED;
 
   supervised[i].state = SUPERVISEE_RUNNING;
   supervised[i].pid = pid;
@@ -286,13 +295,13 @@ OperationResult check_supervisee(Supervisee *s)
 }
 
 /*@
-  requires signal_handlers_installed == 1;
-  requires signal_handlers_blocked == 0;
-  requires 0 <= nprocs <= MAX_PROCS;
+  requires signal_handlers_configured;
+  requires  valid_supervised;
   requires 0 <= i <= nprocs-1;
-  requires \valid(supervised + (0 .. nprocs-1));
   assigns supervised[0 .. nprocs-1];
+  ensures valid_supervised;
   ensures supervised[i].state == SUPERVISEE_STOPPED;
+
 */
 OperationResult stop_supervisee(int i)
 {
@@ -334,10 +343,9 @@ OperationResult stop_supervisee(int i)
 }
 
 /*@
-  requires signal_handlers_installed == 1;
-  requires signal_handlers_blocked == 0;
-  requires 0 <= nprocs <= MAX_PROCS;
-  requires \valid(supervised + (0 .. nprocs-1));
+  requires signal_handlers_configured;
+  requires valid_supervised;
+  ensures valid_supervised;
   assigns supervised[0 .. nprocs-1];
 */
 OperationResult stop(void)
@@ -356,8 +364,8 @@ OperationResult stop(void)
 }
 
 /*@
-  requires 0 <= nprocs <= MAX_PROCS;
-  requires \valid(supervised + (0 .. nprocs-1));
+  requires valid_supervised;
+  ensures valid_supervised;
   assigns supervised[0 .. nprocs-1];
 */
 OperationResult clean(void)
@@ -376,11 +384,13 @@ OperationResult clean(void)
 }
 
 /*@
-  requires signal_handlers_installed == 1;
-  requires signal_handlers_blocked == 0;
-  requires 0 <= nprocs <= MAX_PROCS;
-  requires \valid(supervised + (0 .. nprocs-1));
+  requires signal_handlers_configured;
+  requires valid_supervised;
   assigns supervised[0 .. nprocs-1];
+  ensures signal_handlers_configured;
+  ensures valid_supervised;
+  assigns signal_handlers_installed;
+  assigns signal_handlers_blocked;
 */
 OperationResult start(void)
 {
@@ -388,8 +398,13 @@ OperationResult start(void)
 
   /*@
     loop assigns i, result;
+    loop assigns signal_handlers_installed;
+    loop assigns signal_handlers_blocked;
     loop assigns supervised[0 .. nprocs-1];
+    loop invariant valid_supervised;
     loop invariant 0 <= i <= nprocs;
+    loop invariant signal_handlers_configured;
+    loop variant nprocs - i;
   */
   for (int i = 0; i < nprocs && result == OP_OK; i++) {
     result = start_supervisee(i);
@@ -399,8 +414,8 @@ OperationResult start(void)
 }
 
 /*@
-  requires \valid(supervised + (0 .. nprocs-1));
-  requires 0 <= nprocs <= MAX_PROCS;
+  requires valid_supervised;
+  ensures valid_supervised;
   assigns supervised[0 .. nprocs-1];
 */
 OperationResult check(void)
@@ -417,10 +432,9 @@ OperationResult check(void)
 }
 
 /*@
-  requires signal_handlers_installed == 1;
-  requires signal_handlers_blocked == 0;
-  requires 0 <= nprocs <= MAX_PROCS;
-  requires \valid(supervised + (0 .. nprocs-1));
+  requires signal_handlers_configured;
+  requires valid_supervised;
+  ensures valid_supervised;
   assigns supervised[0 .. nprocs-1];
 */
 OperationResult wait_and_check(void)
@@ -447,10 +461,12 @@ OperationResult wait_and_check(void)
 
 
 /*@
-  requires signal_handlers_installed == 1;
-  requires signal_handlers_blocked == 0;
-  requires 0 <= nprocs <= MAX_PROCS;
-  requires \valid(supervised + (0 .. nprocs-1));
+  requires signal_handlers_configured;
+  requires valid_supervised;
+  ensures valid_supervised;
+  ensures signal_handlers_configured;
+  assigns signal_handlers_installed;
+  assigns signal_handlers_blocked;
   assigns supervised[0 .. nprocs-1];
 */
 OperationResult supervise_once()
@@ -470,9 +486,9 @@ OperationResult supervise_once()
     return result;
 
   /*@
-  loop invariant \valid(supervised + (0 .. nprocs-1));
-  loop assigns supervised[0 .. nprocs-1];
-  loop assigns result;
+  loop invariant valid_supervised;
+  loop invariant signal_handlers_configured;
+  loop assigns result, supervised[0 .. nprocs-1];
   */
   do {
     result = wait_and_check();
@@ -483,10 +499,11 @@ OperationResult supervise_once()
 
 
 /*@
-  requires signal_handlers_installed == 1;
-  requires signal_handlers_blocked == 0;
-  requires 0 <= nprocs <= MAX_PROCS;
-  requires \valid(supervised + (0 .. nprocs-1));
+  requires signal_handlers_configured;
+  requires valid_supervised;
+  ensures signal_handlers_configured;
+  assigns signal_handlers_installed;
+  assigns signal_handlers_blocked;
   assigns supervised[0 .. nprocs-1];
 */
 int supervise_loop(void)
@@ -495,9 +512,11 @@ int supervise_loop(void)
   int ok = 1;
 
   /*@
-    loop invariant \valid(supervised + (0 .. nprocs-1));
+    loop invariant valid_supervised;
+    loop invariant signal_handlers_configured;
     loop assigns supervised[0 .. nprocs-1];
     loop assigns result;
+    loop assigns signal_handlers_installed, signal_handlers_blocked;
   */
   while (result == OP_FAILED && take_restart_token()) {
     result = supervise_once();
@@ -516,6 +535,7 @@ int supervise_loop(void)
 
   return ok;
 }
+
 
 
 /*@
