@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <poll.h>
 #include <errno.h>
 #include <signal.h>
@@ -64,7 +65,7 @@ static void make_fd_non_blocking(int fd) {
   }
 }
 
-void init_signal_handlers(void)
+void install_signal_handlers(void)
 {
   struct sigaction act;
   sigset_t block_mask;
@@ -195,7 +196,7 @@ WaitResult wait_for_event(int32_t timeout_msecs, pid_t *pid, int *exit)
   if (pollret == 0)
     return WAIT_TIMEOUT;
 
-  if (!fds[0].revents & POLLIN) {
+  if (!(fds[0].revents & POLLIN)) {
     abort();
   }
 
@@ -213,6 +214,7 @@ WaitResult wait_for_event(int32_t timeout_msecs, pid_t *pid, int *exit)
 
   if (sig == SIGNAL_PIPE_EVENT_CHILD) {
     WAIT_CHILD();
+    goto again;
   }
 
   return WAIT_SHUTDOWN_SIGNAL;
@@ -223,4 +225,50 @@ void unreachable(void)
   exit(0);
 }
 
+void exec_child(char *prog)
+{
+  char *const args[2] = {prog, NULL};
+  execvp(prog, args);
+  perror("execvpe failed");
+}
 
+void log_event(char *msg)
+{
+  fprintf(stderr, "%s\n", msg);
+}
+
+double restart_tokens_per_second = 0.1;
+double restart_token_bucket_capacity = 2.0;
+double restart_token_bucket_level = 0.0;
+
+int take_restart_token(void)
+{
+ 
+  static int initialized = 0;
+  static struct timespec prev_take_time = {0};
+  struct timespec t;
+  if (clock_gettime(CLOCK_MONOTONIC, &t) < 0)
+    return 0;
+
+  if (!initialized) {
+    initialized = 1;
+    prev_take_time = t;
+    restart_token_bucket_level = restart_token_bucket_capacity;
+  }
+
+  double elapsed_seconds = (double)(t.tv_sec - prev_take_time.tv_sec)
+     + ((double)(t.tv_nsec - prev_take_time.tv_nsec) / 1000000000.0);
+
+  prev_take_time = t;
+  restart_token_bucket_level += restart_tokens_per_second * elapsed_seconds;
+
+  if ((restart_token_bucket_level > restart_token_bucket_capacity)
+    || restart_token_bucket_level < 0.0 /* Crazy underflow somehow. */)
+    restart_token_bucket_level = restart_token_bucket_capacity;
+
+  if (restart_token_bucket_level < 1.0)
+      return 0;
+
+  restart_token_bucket_level -= 1.0;
+  return 1;
+}

@@ -73,11 +73,11 @@ typedef struct {
   pid_t pid;
   int exitcode;
 
-  const char *clean;
-  const char *run;
-  const char *wait;
-  const char *check;
-  const char *stop;
+  char *clean;
+  char *run;
+  char *wait;
+  char *check;
+  char *stop;
 } Supervisee;
 
 /*@ predicate valid_supervisee{L}(Supervisee s) = s.pid >= -1; */
@@ -91,10 +91,8 @@ Supervisee supervised[MAX_PROCS];
    && (\forall integer i; 0 <= i < nprocs ==> valid_supervisee(supervised[i])); */
  
 
-double restart_token_bucket_level;
-double token_bucket_capacity;
-
 int32_t check_interval_msecs = 10000;
+
 
 /*@ 
   requires signal_handlers_configured;
@@ -131,10 +129,8 @@ pid_t spawn_child(char *prog)
   } else if (pid == 0) {
     reset_signal_handlers();
     unblock_signal_handlers();
-    // setpgid(pid, pid);
-    char *const args[2] = {prog, NULL};
-    // execvp(prog, args);
-    // perror("execvpe failed");
+    setpgid(pid, pid);
+    exec_child(prog);
     unreachable();
     /*
       This code is unreachable due to exec, but to make
@@ -177,7 +173,7 @@ void handle_death(pid_t pid, int exitcode)
   ensures valid_supervised;
   assigns supervised[0 .. nprocs-1];
 */
-OperationResult wait_for_child(pid_t child, int32_t timeout_msecs)
+OperationResult wait_for_child(pid_t child, int ignore_shutdown_requests, int32_t timeout_msecs)
 {
   int termsent = 0;
   int done = 0;
@@ -195,7 +191,7 @@ OperationResult wait_for_child(pid_t child, int32_t timeout_msecs)
     if (wr == WAIT_SHUTDOWN_SIGNAL)
       sigterm = 1;
     
-    if (wr == WAIT_SHUTDOWN_SIGNAL || wr == WAIT_TIMEOUT) {
+    if ((wr == WAIT_SHUTDOWN_SIGNAL && !ignore_shutdown_requests) || wr == WAIT_TIMEOUT) {
       /* 
         Here we send a kill to the pgid.
         What can we do here if kill fails?
@@ -214,10 +210,13 @@ OperationResult wait_for_child(pid_t child, int32_t timeout_msecs)
     }
   }
 
+  if (exitcode != 0)
+    return OP_FAILED;
+
   if (sigterm)
     return OP_SHUTDOWN_REQUESTED;
 
-  return exitcode ? OP_FAILED : OP_OK;
+  return OP_OK;
 }
 
 
@@ -233,13 +232,6 @@ void add_supervisee(Supervisee s)
 {
   supervised[nprocs] = s;
   nprocs = nprocs + 1;
-}
-
-/*@
-  assigns \nothing;
-*/
-int take_restart_token(void) {
-  return 1;
 }
 
 /*@
@@ -311,7 +303,7 @@ OperationResult check_supervisee(int i)
 */
 OperationResult stop_supervisee(int i)
 {
-  int gotshutdown = 0;
+  int shutdown_requested = 0;
 
   if (supervised[i].state == SUPERVISEE_RUNNING) {
     int timeout_msecs = 5000;
@@ -321,7 +313,7 @@ OperationResult stop_supervisee(int i)
     kill(-pid, SIGCONT);
 
     /*@ 
-      loop assigns gotshutdown, timeout_msecs;
+      loop assigns shutdown_requested, timeout_msecs;
       loop assigns supervised[0 .. nprocs-1];
       loop invariant valid_supervised;
     */
@@ -332,7 +324,7 @@ OperationResult stop_supervisee(int i)
       WaitResult wr = wait_for_event(timeout_msecs, &dead, &exitcode);
 
       if (wr == WAIT_SHUTDOWN_SIGNAL)
-        gotshutdown = 1;
+        shutdown_requested = 1;
       
       if (wr == WAIT_TIMEOUT) {
         kill(-pid, SIGKILL);
@@ -346,7 +338,7 @@ OperationResult stop_supervisee(int i)
   }
 
   supervised[i].state = SUPERVISEE_STOPPED;
-  return gotshutdown ? OP_SHUTDOWN_REQUESTED : OP_OK;
+  return shutdown_requested ? OP_SHUTDOWN_REQUESTED : OP_OK;
 }
 
 /*@
@@ -357,18 +349,21 @@ OperationResult stop_supervisee(int i)
 */
 OperationResult stop(void)
 {
+  int shutdown_requested = 0;
   OperationResult result = OP_OK;
 
   /*@
-    loop assigns i, result, supervised[0..nprocs-1];
+    loop assigns i, shutdown_requested, result, supervised[0..nprocs-1];
     loop invariant 0 <= i <= nprocs;
     loop invariant valid_supervised;
   */
-  for (int i = 0; i < nprocs && result == OP_OK; i++) {
+  for (int i = 0; i < nprocs && (result == OP_OK || result == OP_SHUTDOWN_REQUESTED); i++) {
     result = stop_supervisee(nprocs-i-1);
+    if (result == OP_SHUTDOWN_REQUESTED)
+      shutdown_requested = 1;
   }
 
-  return result;
+  return shutdown_requested ? OP_SHUTDOWN_REQUESTED : OP_OK;
 }
 
 /*@
@@ -506,18 +501,23 @@ OperationResult supervise_once()
 {
   OperationResult result;
 
+
+  log_event("stopping children");
   result = stop();
   if (result != OP_OK)
     return result;
 
+  log_event("cleaning up after children");
   result = clean();
   if (result != OP_OK)
     return result;
 
+  log_event("starting children");
   result = start();
   if (result != OP_OK)
     return result;
 
+  log_event("starting child supervision");
   /*@
   loop invariant valid_supervised;
   loop invariant signal_handlers_configured;
@@ -528,6 +528,7 @@ OperationResult supervise_once()
     result = wait_and_check();
   } while (result == OP_OK);
 
+  log_event("finished child supervision");
   return result;
 }
 
@@ -538,22 +539,31 @@ OperationResult supervise_once()
   ensures signal_handlers_configured;
   assigns signal_handlers_installed;
   assigns signal_handlers_blocked;
+  assigns restart_token_bucket_level;
   assigns supervised[0 .. nprocs-1];
 */
 int supervise_loop(void)
 {
-  OperationResult result = OP_FAILED;
+  OperationResult result = OP_OK;
   int ok = 1;
+  int has_restart_token = 0;
 
   /*@
     loop invariant valid_supervised;
     loop invariant signal_handlers_configured;
     loop assigns supervised[0 .. nprocs-1];
     loop assigns result;
+    loop assigns has_restart_token;
+    loop assigns restart_token_bucket_level;
     loop assigns signal_handlers_installed, signal_handlers_blocked;
   */
-  while (result == OP_FAILED && take_restart_token()) {
+  do {
     result = supervise_once();
+    has_restart_token = take_restart_token();
+  } while (result == OP_FAILED && has_restart_token);
+
+  if (!has_restart_token) {
+    log_event("exhausted restart tokens");
   }
 
   if (result != OP_SHUTDOWN_REQUESTED)
@@ -593,5 +603,5 @@ int main (int argc, char **argv)
   };
 
   add_supervisee(s);
-  supervise_loop();
+  return supervise_loop() ? 0 : 1;
 }

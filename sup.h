@@ -55,3 +55,25 @@ WaitResult wait_for_event(int32_t msecs, pid_t *pid, int *exit);
 void unreachable(void);
 
 
+/*@
+  requires signal_handlers_installed == 0;
+  requires signal_handlers_blocked == 0;
+  assigns \nothing;
+*/
+void exec_child(char *prog);
+
+
+/*@
+  assigns \nothing;
+*/
+void log_event(char *msg);
+
+
+extern double restart_tokens_per_second;
+extern double restart_token_bucket_capacity;
+extern double restart_token_bucket_level;
+
+/*@
+  assigns restart_token_bucket_level;
+*/
+int take_restart_token(void);
