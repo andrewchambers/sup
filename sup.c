@@ -28,42 +28,54 @@ static void sig_handler(int signum) {
     } else {
       event = SIGNAL_PIPE_EVENT_EXIT;
     }
-    // The fd is non blocking, on write
-    // error we can't do anything but abort
 
-    write_again:
-    if (write(signal_pipes[1], &event, 1) == -1) {
-      if (errno == EINTR)
-        goto write_again;
-      else if (errno == EAGAIN) {
-        if (event == SIGNAL_PIPE_EVENT_EXIT) {
-          /* 
-            Guarantee that even though the pipe has no room, at least
-            one shutdown signal will still be handled again in the future.
-          */
-          shutdown_signal_dropped = 1;
+    while (1) {
+      if (write(signal_pipes[1], &event, 1) == -1) {
+        if (errno == EINTR)
+          continue;
+        else if (errno == EAGAIN) {
+          if (event == SIGNAL_PIPE_EVENT_EXIT) {
+            /* 
+              Guarantee that even though the pipe has no room, at least
+              one shutdown signal will still be handled again in the future.
+            */
+            shutdown_signal_dropped = 1;
+          }
+        } else {
+          perror("write failed");
+          abort();
         }
-      } else {
-        perror("write failed");
-        abort();
       }
-
+      break;
     }
     
     errno = orig_errno;
 }
 
 static void make_fd_non_blocking(int fd) {
-  int flags = fcntl(fd, F_GETFL, 0);
-  if (flags == -1) {
-    perror("fnctl failed");
-    abort();
+   int flags;
+  while (1) {
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) {
+      if (errno == EINTR)
+        continue;
+      perror("fnctl failed");
+      abort();
+    }
+    break;
   }
-  if (fcntl(fd, F_SETFL, flags | O_NONBLOCK | O_CLOEXEC) == -1) {
-    perror("fnctl failed");
-    abort();
+
+  while (1) {
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK | O_CLOEXEC) == -1) {
+      if (errno == EINTR)
+        continue;
+      perror("fnctl failed");
+      abort();
+    }
+    break;
   }
 }
+
 
 void install_signal_handlers(void)
 {
@@ -78,12 +90,17 @@ void install_signal_handlers(void)
   act.sa_handler = sig_handler;
   act.sa_mask = block_mask;
 
-  if ((sigaction(SIGTERM, &act, NULL) == -1) ||
-      (sigaction(SIGHUP, &act, NULL) == -1)  ||
-      (sigaction(SIGINT, &act, NULL) == -1)  ||
-      (sigaction(SIGCHLD, &act, NULL) == -1)) {
-     perror("sigaction failed");
-    abort();
+  while (1) {
+    if ((sigaction(SIGTERM, &act, NULL) == -1) ||
+        (sigaction(SIGHUP, &act, NULL) == -1)  ||
+        (sigaction(SIGINT, &act, NULL) == -1)  ||
+        (sigaction(SIGCHLD, &act, NULL) == -1)) {
+      if (errno == EINTR)
+        continue;
+      perror("sigaction failed");
+      abort();
+    }
+    break;
   }
 
   if (pipe(signal_pipes) == -1)
@@ -101,12 +118,17 @@ void reset_signal_handlers(void) {
   act.sa_handler = SIG_DFL;
   act.sa_mask = block_mask;
 
-  if ((sigaction(SIGTERM, &act, NULL) == -1) ||
-      (sigaction(SIGHUP, &act, NULL) == -1)  ||
-      (sigaction(SIGINT, &act, NULL) == -1)  ||
-      (sigaction(SIGCHLD, &act, NULL) == -1)) {
-    perror("sigaction failed");
-    abort();
+  while (1) {
+    if ((sigaction(SIGTERM, &act, NULL) == -1) ||
+        (sigaction(SIGHUP, &act, NULL) == -1)  ||
+        (sigaction(SIGINT, &act, NULL) == -1)  ||
+        (sigaction(SIGCHLD, &act, NULL) == -1)) {
+      if (errno == EINTR)
+        continue;
+      perror("sigaction failed");
+      abort();
+    }
+    break;
   }
 }
 
@@ -228,8 +250,12 @@ void unreachable(void)
 void exec_child(char *prog)
 {
   char *const args[2] = {prog, NULL};
-  execvp(prog, args);
-  perror("execvpe failed");
+  while (1) {
+    if (execvp(prog, args) == -1 && errno == EINTR)
+      continue;
+    perror("execvpe failed");
+    abort();
+  }
 }
 
 void log_event(char *msg)
@@ -247,8 +273,14 @@ int take_restart_token(void)
   static int initialized = 0;
   static struct timespec prev_take_time = {0};
   struct timespec t;
-  if (clock_gettime(CLOCK_MONOTONIC, &t) < 0)
-    return 0;
+  while (1) {
+    if (clock_gettime(CLOCK_MONOTONIC, &t) < 0) {
+      if (errno == EINTR)
+        continue;
+      return 0;
+    }
+    break;
+  }
 
   if (!initialized) {
     initialized = 1;
@@ -262,7 +294,7 @@ int take_restart_token(void)
   prev_take_time = t;
   restart_token_bucket_level += restart_tokens_per_second * elapsed_seconds;
 
-  if ((restart_token_bucket_level > restart_token_bucket_capacity)
+  if (restart_token_bucket_level > restart_token_bucket_capacity
     || restart_token_bucket_level < 0.0 /* Crazy underflow somehow. */)
     restart_token_bucket_level = restart_token_bucket_capacity;
 
