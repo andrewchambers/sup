@@ -90,6 +90,7 @@ Supervisee supervised[MAX_PROCS];
    && (\forall integer i; 0 <= i < nprocs ==> valid_supervisee(supervised[i])); */
  
 
+char *lifecycle_hook_running = NULL;
 int32_t check_interval_msecs = 5000;
 
 
@@ -639,6 +640,16 @@ OperationResult supervise_once()
   result = start();
   if (result != OP_OK)
     return result;
+
+  if (lifecycle_hook_running) {
+    pid_t pid = spawn_child(lifecycle_hook_running);
+    if (pid == -1)
+      return OP_FAILED;
+
+    result = wait_for_child(pid, 0, 5000); /* TODO right timeout */
+    if (result != OP_OK)
+      return result;
+  }
 
   log_event("starting child supervision");
   /*@
