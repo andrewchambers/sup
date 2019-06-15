@@ -29,26 +29,24 @@ static void sig_handler(int signum) {
       event = SIGNAL_PIPE_EVENT_EXIT;
     }
 
-    while (1) {
-      if (write(signal_pipes[1], &event, 1) == -1) {
-        if (errno == EINTR)
-          continue;
-        else if (errno == EAGAIN) {
-          if (event == SIGNAL_PIPE_EVENT_EXIT) {
-            /* 
-              Guarantee that even though the pipe has no room, at least
-              one shutdown signal will still be handled again in the future.
-            */
-            shutdown_signal_dropped = 1;
-          }
-        } else {
-          perror("write failed");
-          abort();
-        }
+    int wrc;
+    do {
+      wrc = write(signal_pipes[1], &event, 1);
+    } while(wrc == -1 && errno == EINTR);
+
+    if (wrc == -1) {
+      if (errno == EAGAIN && event == SIGNAL_PIPE_EVENT_EXIT) {
+        /* 
+          Guarantee that even though the pipe has no room, at least
+          one shutdown signal will still be handled again in the future.
+        */
+        shutdown_signal_dropped = 1;
+      } else {
+        perror("write failed");
+        abort();
       }
-      break;
     }
-    
+  
     errno = orig_errno;
 }
 
@@ -141,9 +139,14 @@ static void mask_signals(int how)
   sigaddset(&block_mask, SIGHUP);
   sigaddset(&block_mask, SIGCHLD);
   
-  if (sigprocmask(how, &block_mask, NULL) == -1){
-    perror("sigprocmask failed");
-    abort();
+  while (1) {
+    if (sigprocmask(how, &block_mask, NULL) == -1) {
+      if (errno == EINTR)
+        continue;
+      perror("sigprocmask failed");
+      abort();
+    }
+    break;
   }
 }
 
@@ -176,7 +179,7 @@ WaitResult wait_for_event(int32_t timeout_msecs, pid_t *pid, int *exit)
 
 #define WAIT_CHILD() do { \
     wpid = waitpid(-1, &status, WNOHANG); \
-    if (wpid == -1) { \
+    if (wpid == -1 && errno != ECHILD) { \
       if (errno == EINTR) \
         goto again; \
       perror("waitpid failed"); \
@@ -244,7 +247,7 @@ WaitResult wait_for_event(int32_t timeout_msecs, pid_t *pid, int *exit)
 
 void unreachable(void)
 {
-  exit(0);
+  abort();
 }
 
 void exec_child(char *prog)

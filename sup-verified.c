@@ -91,12 +91,12 @@ Supervisee supervised[MAX_PROCS];
    && (\forall integer i; 0 <= i < nprocs ==> valid_supervisee(supervised[i])); */
  
 
-int32_t check_interval_msecs = 10000;
+int32_t check_interval_msecs = 5000;
 
 
 /*@ 
   requires signal_handlers_configured;
-  ensures \result >= -1;
+  ensures \result == -1 || \result > 0;
   ensures signal_handlers_configured;
   assigns signal_handlers_installed;
   assigns signal_handlers_blocked;
@@ -166,32 +166,42 @@ void handle_death(pid_t pid, int exitcode)
   }
 }
 
+enum {
+  WAIT_FOR_CHILD_FLAG_IGNORE_SHUTDOWN_REQUESTS = 1 << 0,
+};
+
 /*@
   requires signal_handlers_configured;
   requires valid_supervised;
   requires child > 0;
-  ensures valid_supervised;
   assigns supervised[0 .. nprocs-1];
+  ensures valid_supervised;
+  ensures \result == OP_OK 
+    || \result == OP_FAILED 
+    || \result == OP_SHUTDOWN_REQUESTED;
 */
-OperationResult wait_for_child(pid_t child, int ignore_shutdown_requests, int32_t timeout_msecs)
+OperationResult wait_for_child(pid_t child, int flags, int32_t timeout_msecs)
 {
   int termsent = 0;
   int done = 0;
   pid_t dead = 0;
   int exitcode = 0;
-  int sigterm = 0;
+  int sigshutdown = 0;
 
  /*@ 
-    loop assigns done, timeout_msecs, dead, sigterm, termsent;
+    loop assigns done, timeout_msecs, dead, sigshutdown, termsent;
     loop assigns exitcode, supervised[0 .. nprocs-1];
     loop invariant valid_supervised;
   */
   while (!done) {
     WaitResult wr = wait_for_event(timeout_msecs, &dead, &exitcode);
-    if (wr == WAIT_SHUTDOWN_SIGNAL)
-      sigterm = 1;
+
     
-    if ((wr == WAIT_SHUTDOWN_SIGNAL && !ignore_shutdown_requests) || wr == WAIT_TIMEOUT) {
+    if (wr == WAIT_TIMEOUT 
+        || (wr == WAIT_SHUTDOWN_SIGNAL && !(flags&WAIT_FOR_CHILD_FLAG_IGNORE_SHUTDOWN_REQUESTS))) {
+
+      if (wr == WAIT_SHUTDOWN_SIGNAL)
+        sigshutdown = 1;
       /* 
         Here we send a kill to the pgid.
         What can we do here if kill fails?
@@ -210,11 +220,11 @@ OperationResult wait_for_child(pid_t child, int ignore_shutdown_requests, int32_
     }
   }
 
+  if (sigshutdown)
+    return OP_SHUTDOWN_REQUESTED;
+
   if (exitcode != 0)
     return OP_FAILED;
-
-  if (sigterm)
-    return OP_SHUTDOWN_REQUESTED;
 
   return OP_OK;
 }
@@ -238,11 +248,14 @@ void add_supervisee(Supervisee s)
   requires signal_handlers_configured;
   requires valid_supervised;
   requires 0 <= i < nprocs;
-  ensures signal_handlers_configured;
-  ensures valid_supervised;
   assigns signal_handlers_installed;
   assigns signal_handlers_blocked;
   assigns supervised[i];
+  ensures signal_handlers_configured;
+  ensures valid_supervised;
+  ensures supervised[i].state == SUPERVISEE_CLEANED;
+  ensures supervised[i].exitcode == -1;
+  ensures supervised[i].pid == -1;
 */
 OperationResult clean_supervisee(int i)
 {
@@ -250,8 +263,9 @@ OperationResult clean_supervisee(int i)
 
   // TODO wait for clean.
   // or kill clean on other error.
-
   supervised[i].state = SUPERVISEE_CLEANED;
+  supervised[i].exitcode = -1;
+  supervised[i].pid = -1;
   return OP_OK;
 }
 
@@ -263,7 +277,29 @@ OperationResult clean_supervisee(int i)
   ensures valid_supervised;
   assigns signal_handlers_installed;
   assigns signal_handlers_blocked;
-  assigns supervised[i];
+  assigns supervised[0 .. nprocs-1];
+*/
+OperationResult wait_supervisee(int i)
+{
+ if (!supervised[i].wait)
+  return OP_OK;
+
+  pid_t pid = spawn_child(supervised[i].wait);
+  if (pid == -1)
+    return OP_FAILED;
+
+  return wait_for_child(pid, 0, 5000); /* TODO right timeout */
+}
+
+/*@
+  requires signal_handlers_configured;
+  requires valid_supervised;
+  requires 0 <= i < nprocs;
+  ensures signal_handlers_configured;
+  ensures valid_supervised;
+  assigns signal_handlers_installed;
+  assigns signal_handlers_blocked;
+  assigns supervised[0 .. nprocs-1];
 */
 OperationResult start_supervisee(int i)
 {
@@ -274,7 +310,8 @@ OperationResult start_supervisee(int i)
 
   supervised[i].state = SUPERVISEE_RUNNING;
   supervised[i].pid = pid;
-  return OP_OK;
+
+  return wait_supervisee(i);
 }
 
 /*@
@@ -285,10 +322,27 @@ OperationResult start_supervisee(int i)
   ensures valid_supervised;
   assigns signal_handlers_installed;
   assigns signal_handlers_blocked;
-  assigns supervised[i];
+  assigns supervised[0 .. nprocs-1];
+  ensures \result == OP_OK || \result == OP_FAILED || \result == OP_SHUTDOWN_REQUESTED;
 */
 OperationResult check_supervisee(int i)
 {
+
+  if (supervised[i].check) {
+    log_event("checking supervisee.");
+
+    pid_t pid = spawn_child(supervised[i].check);
+    if (pid == -1)
+      return OP_FAILED;
+
+    OperationResult check_result = wait_for_child(pid, 0, 5000); /* TODO right timeout */
+    if (check_result != OP_OK)
+      return check_result;
+  }
+
+  if (supervised[i].state != SUPERVISEE_RUNNING)
+    return OP_FAILED;
+
   return OP_OK;
 }
 
@@ -296,26 +350,47 @@ OperationResult check_supervisee(int i)
   requires signal_handlers_configured;
   requires  valid_supervised;
   requires 0 <= i < nprocs;
+  assigns signal_handlers_installed;
+  assigns signal_handlers_blocked;
   assigns supervised[0 .. nprocs-1];
+  ensures signal_handlers_configured;
   ensures valid_supervised;
   ensures supervised[i].state == SUPERVISEE_STOPPED;
-
+  ensures \result == OP_OK || \result == OP_SHUTDOWN_REQUESTED;
 */
 OperationResult stop_supervisee(int i)
 {
+  int sigterm_sent = 0;
   int shutdown_requested = 0;
+  int timeout_msecs = 5000; /* TODO right timeout */
+
 
   if (supervised[i].state == SUPERVISEE_RUNNING) {
-    int timeout_msecs = 5000;
     pid_t pid = supervised[i].pid;
 
-    kill(-pid, SIGTERM);
-    kill(-pid, SIGCONT);
+    if (supervised[i].stop) {
+      log_event("running stop");
+
+      pid_t pid = spawn_child(supervised[i].stop);
+      if (pid > 0) {
+        OperationResult result = wait_for_child(pid, WAIT_FOR_CHILD_FLAG_IGNORE_SHUTDOWN_REQUESTS, timeout_msecs);
+        if (result != OP_OK) {
+          log_event("stop command failed, sending SIGTERM");
+          kill(-pid, SIGTERM);
+          sigterm_sent = 1;
+        }
+      }
+    } else {
+       log_event("sending SIGTERM");
+       kill(-pid, SIGTERM);
+       sigterm_sent = 1;
+    }
 
     /*@ 
-      loop assigns shutdown_requested, timeout_msecs;
-      loop assigns supervised[0 .. nprocs-1];
       loop invariant valid_supervised;
+      loop invariant signal_handlers_configured;
+      loop assigns shutdown_requested, timeout_msecs, sigterm_sent;
+      loop assigns supervised[0 .. nprocs-1];
     */
     while (supervised[i].state == SUPERVISEE_RUNNING) {
       pid_t dead = 0;
@@ -327,7 +402,15 @@ OperationResult stop_supervisee(int i)
         shutdown_requested = 1;
       
       if (wr == WAIT_TIMEOUT) {
-        kill(-pid, SIGKILL);
+        log_event("shutdown timeout");
+        if (sigterm_sent) {
+          log_event("sending SIGKILL");
+          kill(-pid, SIGKILL);
+        } else {
+          log_event("sending SIGTERM");
+          kill(-pid, SIGTERM);
+        }
+        sigterm_sent = 1;
         timeout_msecs = 7000;
       }
       
@@ -344,8 +427,12 @@ OperationResult stop_supervisee(int i)
 /*@
   requires signal_handlers_configured;
   requires valid_supervised;
-  ensures valid_supervised;
   assigns supervised[0 .. nprocs-1];
+  assigns signal_handlers_installed;
+  assigns signal_handlers_blocked;
+  ensures signal_handlers_configured;
+  ensures valid_supervised;
+  ensures \result == OP_OK || \result == OP_SHUTDOWN_REQUESTED;
 */
 OperationResult stop(void)
 {
@@ -354,10 +441,13 @@ OperationResult stop(void)
 
   /*@
     loop assigns i, shutdown_requested, result, supervised[0..nprocs-1];
+    loop assigns signal_handlers_installed, signal_handlers_blocked;
+    loop invariant signal_handlers_configured;
     loop invariant 0 <= i <= nprocs;
+    loop invariant result == OP_OK || result == OP_SHUTDOWN_REQUESTED;
     loop invariant valid_supervised;
   */
-  for (int i = 0; i < nprocs && (result == OP_OK || result == OP_SHUTDOWN_REQUESTED); i++) {
+  for (int i = 0; i < nprocs ; i++) {
     result = stop_supervisee(nprocs-i-1);
     if (result == OP_SHUTDOWN_REQUESTED)
       shutdown_requested = 1;
@@ -375,26 +465,41 @@ OperationResult stop(void)
   ensures valid_supervised;
   ensures signal_handlers_configured;
   ensures valid_supervised;
+  ensures \result == OP_OK || \result == OP_SHUTDOWN_REQUESTED || \result == OP_FAILED;
 */
 OperationResult clean(void)
 {
+  int had_error = 0;
+  int shutdown_requested = 0;
   OperationResult result = OP_OK;
 
   /*@
-    loop assigns i, result;
+    loop assigns i, result, shutdown_requested, had_error;
     loop assigns signal_handlers_installed;
     loop assigns signal_handlers_blocked;
     loop assigns supervised[0 .. nprocs-1];
     loop invariant valid_supervised;
-    loop invariant 0 <= i <= nprocs;
     loop invariant signal_handlers_configured;
+    loop invariant 0 <= i <= nprocs;
     loop variant nprocs - i;
   */
-  for (int i = 0; i < nprocs && result == OP_OK; i++) {
-    result = clean_supervisee(nprocs-i-1);
+  for (int i = 0; i < nprocs; i++) {
+    OperationResult result = clean_supervisee(nprocs-i-1);
+    if (result == OP_SHUTDOWN_REQUESTED)
+      shutdown_requested = 1;
+    if (result == OP_FAILED)
+      had_error = 1;
   }
 
-  return result;
+  if (had_error) {
+    return OP_FAILED;
+  }
+
+  if (shutdown_requested) {
+    return OP_SHUTDOWN_REQUESTED;
+  }
+
+  return OP_OK;
 }
 
 /*@
@@ -431,10 +536,11 @@ OperationResult start(void)
   requires signal_handlers_configured;
   requires valid_supervised;
   assigns supervised[0 .. nprocs-1];
-  ensures signal_handlers_configured;
-  ensures valid_supervised;
   assigns signal_handlers_installed;
   assigns signal_handlers_blocked;
+  ensures signal_handlers_configured;
+  ensures valid_supervised;
+  ensures \result == OP_OK || \result == OP_FAILED || \result == OP_SHUTDOWN_REQUESTED;
 */
 OperationResult check(void)
 {
@@ -447,6 +553,7 @@ OperationResult check(void)
     loop invariant valid_supervised;
     loop invariant 0 <= i <= nprocs;
     loop invariant signal_handlers_configured;
+    loop invariant result == OP_OK || result == OP_FAILED || result == OP_SHUTDOWN_REQUESTED;
     loop variant nprocs - i;
   */
   for (int i = 0; i < nprocs && result == OP_OK; i++) {
@@ -471,7 +578,6 @@ OperationResult wait_and_check(void)
   int done = 0;
   pid_t dead = 0;
   int exitcode = 0;
-  int sigterm = 0;
 
   WaitResult wr = wait_for_event(check_interval_msecs, &dead, &exitcode);
   if (wr == WAIT_SHUTDOWN_SIGNAL) {
@@ -486,7 +592,6 @@ OperationResult wait_and_check(void)
     return OP_UNREACHABLE;
   }
 }
-
 
 /*@
   requires signal_handlers_configured;
@@ -528,7 +633,6 @@ OperationResult supervise_once()
     result = wait_and_check();
   } while (result == OP_OK);
 
-  log_event("finished child supervision");
   return result;
 }
 
@@ -558,29 +662,46 @@ int supervise_loop(void)
     loop assigns signal_handlers_installed, signal_handlers_blocked;
   */
   do {
+    log_event("supervisor (re)starting chilren");
     result = supervise_once();
     has_restart_token = take_restart_token();
   } while (result == OP_FAILED && has_restart_token);
 
-  if (!has_restart_token) {
+  if (result == OP_SHUTDOWN_REQUESTED) {
+    log_event("got a shutdown request");
+  } else if (!has_restart_token) {
     log_event("exhausted restart tokens");
   }
 
   if (result != OP_SHUTDOWN_REQUESTED)
     ok = 0;
 
+  log_event("performing shutdown, stopping children");
   result = stop();
-  if (result != OP_OK)
-    ok = 0;
+  /*@ assert result == OP_OK || result == OP_SHUTDOWN_REQUESTED; */
+
+  /*@ 
+    loop assigns i, ok;
+    loop invariant 0 <= i <= nprocs;
+    loop invariant signal_handlers_configured;
+  */
+  for (int i = 0; i < nprocs; i++) {
+    /*
+      If the exit code was set, and it wasn't zero we had an error.
+    */
+    if (supervised[i].exitcode > 0) {
+      log_event("shutdown was not clean");
+      ok = 0;
+    }
+  }
   
+  log_event("performing shutdown, cleaning up");
   result = clean();
   if (result != OP_OK)
     ok = 0;
 
   return ok;
 }
-
-
 
 /*@
   requires signal_handlers_installed == 0;
@@ -594,12 +715,12 @@ int main (int argc, char **argv)
   Supervisee s = (Supervisee) {
     .state = SUPERVISEE_STOPPED,
     .pid = -1,
-    .exitcode = 0,
+    .exitcode = -1,
     .clean = NULL,
-    .run = "./foo",
-    .wait = NULL,
-    .check = NULL,
-    .stop = NULL,
+    .run = "./run",
+    .wait = "./wait",
+    .check = "./check",
+    .stop = "./stop",
   };
 
   add_supervisee(s);
